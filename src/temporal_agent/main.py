@@ -1,0 +1,74 @@
+import asyncio
+import sys
+from dotenv import load_dotenv
+
+load_dotenv()
+
+from temporalio.client import Client, WorkflowUpdateStage
+from temporalio.worker import Worker
+from temporal_agent import activities
+from temporal_agent.workflows import LiveAgentWorkflow
+
+async def main():
+    try:
+        client = await Client.connect("localhost:7233")
+    except Exception as e:
+        print(f"CRITICAL: Failed connecting to Temporal Server: {e}")
+        sys.exit(1)
+
+    SESSION_ID = "uv_scaled_agent_session_011"
+
+    worker = Worker(
+        client,
+        task_queue="live-agent-tasks",
+        workflows=[LiveAgentWorkflow],
+        activities=[activities.execute_agent_brain],
+    )
+    worker_task = asyncio.create_task(worker.run())
+    print("🤖 Streaming Agent Worker Active.")
+    print("Type your message below (try sharing your name, or asking for 'mac stats').\n")
+
+    try:
+        handle = await client.start_workflow(
+            LiveAgentWorkflow.run, args=[SESSION_ID], id=SESSION_ID, task_queue="live-agent-tasks"
+        )
+    except Exception:
+        handle = client.get_workflow_handle(SESSION_ID)
+
+    while True:
+        prompt = await asyncio.get_event_loop().run_in_executor(None, input, "You: ")
+        prompt = prompt.strip()
+        
+        if prompt.lower() == "q":
+            await handle.signal(LiveAgentWorkflow.shutdown_agent)
+            break
+        if not prompt:
+            continue
+            
+        await handle.start_update(
+            LiveAgentWorkflow.handle_agent_turn, 
+            args=[SESSION_ID, prompt],
+            wait_for_stage=WorkflowUpdateStage.ACCEPTED
+        )
+        print("Assistant: ", end="", flush=True)
+        
+        while True:
+            await asyncio.sleep(0.03)
+            chunks = await handle.query(LiveAgentWorkflow.fetch_stream_buffer)
+            for chunk in chunks:
+                print(str(chunk), end="", flush=True)
+                
+            is_thinking = await handle.query(LiveAgentWorkflow.is_thinking)
+            if not is_thinking:
+                final_chunks = await handle.query(LiveAgentWorkflow.fetch_stream_buffer)
+                for chunk in final_chunks:
+                    print(str(chunk), end="", flush=True)
+                break
+                
+        print("\n")
+
+    await worker.shutdown()
+    await worker_task
+
+if __name__ == "__main__":
+    asyncio.run(main())
