@@ -14,7 +14,8 @@ dependencies = [
 ]
 
 [project.scripts]
-temporal-agent = "temporal_agent:main"
+temporal-agent = "temporal_agent.main:run_services"
+temporal-agent-worker = "temporal_agent.worker:main"
 
 [build-system]
 requires = ["uv_build>=0.12.15,<0.13.0"]

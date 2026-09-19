@@ -1,6 +1,8 @@
 import asyncio
 import sys
+from uuid import uuid4
 from temporalio.client import Client, WorkflowUpdateStage
+from temporal_agent import database
 from temporal_agent.workflows import LiveAgentWorkflow
 
 async def main():
@@ -12,6 +14,7 @@ async def main():
 
     # Use the EXACT same session ID as your web UI to share memory history!
     SESSION_ID = "web_ui_session_002"
+    database.init_db()
 
     try:
         handle = client.get_workflow_handle(SESSION_ID)
@@ -37,25 +40,26 @@ async def main():
             continue
 
         # Send prompt update to Temporal
+        turn_id = str(uuid4())
+        database.create_turn(turn_id, SESSION_ID, prompt)
         await handle.start_update(
             LiveAgentWorkflow.handle_agent_turn,
-            args=[SESSION_ID, prompt],
+            args=[SESSION_ID, prompt, turn_id],
             wait_for_stage=WorkflowUpdateStage.ACCEPTED
         )
         print("Assistant: ", end="", flush=True)
 
         # Read the streaming token buffer in real-time
+        next_sequence = 0
         while True:
             await asyncio.sleep(0.03)
-            chunks = await handle.query(LiveAgentWorkflow.fetch_stream_buffer)
-            for chunk in chunks:
+            chunks = database.load_stream_chunks(turn_id, next_sequence)
+            for sequence, chunk in chunks:
+                next_sequence = sequence + 1
                 print(str(chunk), end="", flush=True)
 
-            is_thinking = await handle.query(LiveAgentWorkflow.is_thinking)
-            if not is_thinking:
-                final_chunks = await handle.query(LiveAgentWorkflow.fetch_stream_buffer)
-                for chunk in final_chunks:
-                    print(str(chunk), end="", flush=True)
+            turn = database.get_turn(turn_id)
+            if turn and turn["status"] in {"completed", "failed"}:
                 break
 
         print("\n")

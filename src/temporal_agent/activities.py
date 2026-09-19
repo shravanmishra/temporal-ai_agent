@@ -1,10 +1,8 @@
 import asyncio
-import json
 import re
 from datetime import datetime
 import psutil
 from temporalio import activity
-from temporalio.client import Client
 from openai import OpenAI
 from temporal_agent import database
 
@@ -13,12 +11,20 @@ def _get_mac_metrics() -> str:
     ram = psutil.virtual_memory().percent
     return f"Current Mac Hardware Status -> CPU Usage: {cpu}%, RAM Usage: {ram}%"
 
-def _sync_agent_execution(session_id: str, prompt: str, workflow_id: str) -> str:
+def _sync_agent_execution(session_id: str, prompt: str, turn_id: str) -> str:
     database.init_db()
+    turn = database.get_turn(turn_id)
+    if turn is None:
+        database.create_turn(turn_id, session_id, prompt)
+        turn = database.get_turn(turn_id)
+    if turn and turn["status"] == "completed":
+        return turn["response"] or ""
+
+    database.mark_turn_running(turn_id)
     history = database.load_messages(session_id)
     known_facts = database.load_facts(session_id)
     
-    database.append_message(session_id, "user", prompt)
+    database.append_message(session_id, "user", prompt, turn_id)
 
     facts_str = ", ".join([f"{k}: {v}" for k, v in known_facts.items()]) if known_facts else "None yet"
     
@@ -44,12 +50,8 @@ def _sync_agent_execution(session_id: str, prompt: str, workflow_id: str) -> str
 
     client = OpenAI(base_url="http://localhost:11434/v1", api_key="ollama")
     
-    async def emit_token_signal(token_fragment: str):
-        c = await Client.connect("localhost:7233")
-        h = c.get_workflow_handle(workflow_id)
-        await h.signal("stream_chunk", token_fragment)
-
     full_response = ""
+    sequence = 0
     try:
         stream = client.chat.completions.create(
             model="llama3.2:1b",
@@ -62,10 +64,12 @@ def _sync_agent_execution(session_id: str, prompt: str, workflow_id: str) -> str
             if chunk.choices and chunk.choices[0].delta.content:
                 token = chunk.choices[0].delta.content
                 full_response += token
-                asyncio.run(emit_token_signal(token))
+                database.append_stream_chunk(turn_id, sequence, token)
+                sequence += 1
                 
-    except Exception as e:
-        full_response = f"[Agent Error: Could not generate response due to {str(e)}]"
+    except Exception as exc:
+        database.fail_turn(turn_id, str(exc))
+        raise
 
     # === Deterministic Python Memory Extraction ===
     # If the user says "my name is X", catch it right here using regex patterns
@@ -74,9 +78,10 @@ def _sync_agent_execution(session_id: str, prompt: str, workflow_id: str) -> str
         extracted_name = name_match.group(1).capitalize()
         database.upsert_fact(session_id, "name", extracted_name)
 
-    database.append_message(session_id, "assistant", full_response)
+    database.append_message(session_id, "assistant", full_response, turn_id)
+    database.complete_turn(turn_id, full_response)
     return full_response
 
 @activity.defn
-async def execute_agent_brain(session_id: str, prompt: str, workflow_id: str) -> str:
-    return await asyncio.to_thread(_sync_agent_execution, session_id, prompt, workflow_id)
+async def execute_agent_brain(session_id: str, prompt: str, turn_id: str) -> str:
+    return await asyncio.to_thread(_sync_agent_execution, session_id, prompt, turn_id)
