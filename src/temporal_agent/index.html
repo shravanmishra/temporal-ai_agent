@@ -12,11 +12,20 @@
             display: flex;
             justify-content: center;
             align-items: center;
-            height: 100vh;
+            min-height: 100vh;
+            min-height: 100dvh;
+            padding: 16px;
+            box-sizing: border-box;
+        }
+        *,
+        *::before,
+        *::after {
+            box-sizing: border-box;
         }
         .chat-container {
-            width: 480px;
-            height: 600px;
+            width: min(480px, 100%);
+            height: min(720px, calc(100dvh - 32px));
+            min-height: min(560px, calc(100dvh - 32px));
             background: white;
             border-radius: 12px;
             box-shadow: 0 4px 20px rgba(0,0,0,0.08);
@@ -34,6 +43,7 @@
         .chat-messages {
             flex: 1;
             padding: 16px;
+            min-height: 0;
             overflow-y: auto;
             display: flex;
             flex-direction: column;
@@ -46,6 +56,7 @@
             font-size: 14px;
             line-height: 1.4;
             white-space: pre-wrap;
+            overflow-wrap: anywhere;
         }
         .user-message {
             background-color: #0071e3;
@@ -61,13 +72,15 @@
         }
         .chat-input-area {
             border-top: 1px solid #d2d2d7;
-            padding: 12px;
+            padding: 12px max(12px, env(safe-area-inset-right)) max(12px, env(safe-area-inset-bottom)) max(12px, env(safe-area-inset-left));
             display: flex;
             gap: 8px;
             background: #f5f5f7;
         }
         input {
             flex: 1;
+            min-width: 0;
+            box-sizing: border-box;
             padding: 10px;
             border: 1px solid #d2d2d7;
             border-radius: 8px;
@@ -82,8 +95,84 @@
             border-radius: 8px;
             font-weight: 500;
             cursor: pointer;
+            min-height: 42px;
+            white-space: nowrap;
         }
         button:hover { background: #0077ed; }
+        button:disabled,
+        input:disabled {
+            opacity: 0.65;
+            cursor: wait;
+        }
+
+        @media (max-width: 600px) {
+            body {
+                align-items: stretch;
+                padding: 0;
+            }
+
+            .chat-container {
+                width: 100%;
+                height: 100vh;
+                height: 100dvh;
+                min-height: 0;
+                border-radius: 0;
+                box-shadow: none;
+            }
+
+            .chat-header {
+                padding-top: max(14px, env(safe-area-inset-top));
+            }
+
+            .chat-messages {
+                padding: 12px;
+            }
+
+            .message {
+                max-width: 88%;
+                font-size: 15px;
+            }
+
+            .chat-input-area {
+                padding-top: 10px;
+            }
+
+            input,
+            button {
+                font-size: 16px;
+            }
+        }
+
+        @media (max-height: 600px) and (orientation: landscape) {
+            body {
+                padding: 0;
+            }
+
+            .chat-container {
+                width: min(720px, calc(100% - 24px));
+                height: 100dvh;
+                min-height: 0;
+                border-radius: 0;
+                box-shadow: none;
+            }
+
+            .chat-header {
+                padding: 8px 12px;
+            }
+
+            .chat-messages {
+                padding: 8px 12px;
+                gap: 8px;
+            }
+
+            .message {
+                padding: 8px 12px;
+            }
+
+            .chat-input-area {
+                padding: 8px 12px;
+            }
+        }
     </style>
 </head>
 <body>
@@ -99,7 +188,22 @@
 
 <script>
     const SESSION_STORAGE_KEY = 'temporal-agent-session-id-v2';
-    let sessionId = localStorage.getItem(SESSION_STORAGE_KEY) || `web_ui_${crypto.randomUUID()}`;
+    function createSessionId() {
+        if (crypto.randomUUID) return crypto.randomUUID();
+        if (crypto.getRandomValues) {
+            const bytes = new Uint8Array(16);
+            crypto.getRandomValues(bytes);
+            bytes[6] = (bytes[6] & 0x0f) | 0x40;
+            bytes[8] = (bytes[8] & 0x3f) | 0x80;
+            return [...bytes].map((byte, index) => {
+                const value = byte.toString(16).padStart(2, '0');
+                return [4, 6, 8, 10].includes(index) ? `-${value}` : value;
+            }).join('');
+        }
+        return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    }
+
+    let sessionId = localStorage.getItem(SESSION_STORAGE_KEY) || `web_ui_${createSessionId()}`;
     localStorage.setItem(SESSION_STORAGE_KEY, sessionId);
     let requestInFlight = false;
 
@@ -122,7 +226,8 @@
         const assistantBubble = appendMessage('', 'assistant-message');
 
         try {
-            const response = await fetch('http://localhost:8000/api/chat/stream', {
+            const apiBaseUrl = `http://${window.location.hostname}:8000`;
+            const response = await fetch(`${apiBaseUrl}/api/chat/stream`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ session_id: sessionId, prompt: text })
@@ -159,7 +264,7 @@
 
                         if (eventType === 'error') {
                             assistantBubble.textContent = `[Workflow error: ${token}]`;
-                            sessionId = `web_ui_${crypto.randomUUID()}`;
+                            sessionId = `web_ui_${createSessionId()}`;
                             localStorage.setItem(SESSION_STORAGE_KEY, sessionId);
                             eventType = 'message';
                             continue;
