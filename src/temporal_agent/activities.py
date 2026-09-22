@@ -1,5 +1,7 @@
 import asyncio
+import os
 import re
+import time
 from datetime import datetime
 import psutil
 from temporalio import activity
@@ -11,16 +13,22 @@ def _get_mac_metrics() -> str:
     ram = psutil.virtual_memory().percent
     return f"Current Mac Hardware Status -> CPU Usage: {cpu}%, RAM Usage: {ram}%"
 
+def _get_current_time() -> str:
+    return datetime.now().astimezone().strftime("Current time: %Y-%m-%d %H:%M:%S %Z")
+
+def _get_current_date() -> str:
+    return datetime.now().astimezone().strftime("Today's date: %Y-%m-%d")
+
 def _sync_agent_execution(session_id: str, prompt: str, turn_id: str) -> str:
-    database.init_db()
-    turn = database.get_turn(turn_id)
+    database.init_db(session_id)
+    turn = database.get_turn(session_id, turn_id)
     if turn is None:
-        database.create_turn(turn_id, session_id, prompt)
-        turn = database.get_turn(turn_id)
+        database.create_turn(session_id, turn_id, prompt)
+        turn = database.get_turn(session_id, turn_id)
     if turn and turn["status"] == "completed":
         return turn["response"] or ""
 
-    database.mark_turn_running(turn_id)
+    database.mark_turn_running(session_id, turn_id)
     history = database.load_messages(session_id)
     known_facts = database.load_facts(session_id)
     
@@ -28,33 +36,54 @@ def _sync_agent_execution(session_id: str, prompt: str, turn_id: str) -> str:
 
     facts_str = ", ".join([f"{k}: {v}" for k, v in known_facts.items()]) if known_facts else "None yet"
     
-    # Clean system prompt with zero tracking bracket layout noise
     system_instructions = (
         "You are a helpful, extremely concise personal assistant running locally on a Mac M1.\n"
-        f"The current local system time is: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
         f"Information about the user: {facts_str}\n\n"
-        "Answer the user's questions clearly and directly based on this context. Do not mention memory tags."
+        "Answer the user's questions clearly and directly based on this context. "
+        "Do not invent current time or system metrics; the application supplies those values. "
+        "Do not mention memory tags."
     )
 
     messages = [{"role": "system", "content": system_instructions}]
     for msg in history:
         messages.append({"role": msg["role"], "content": msg["content"]})
         
-    if "mac stat" in prompt.lower() or "cpu usage" in prompt.lower():
-        tool_output = _get_mac_metrics()
-        messages.append({"role": "user", "content": prompt})
-        messages.append({"role": "assistant", "content": f"Let me check that. {tool_output}"})
-        messages.append({"role": "user", "content": "Summarize that hardware check for me."})
+    normalized_prompt = prompt.lower()
+    if re.search(r"\b(current time|what time is it|what(?:'s| is) the time|time now|time)\b", normalized_prompt):
+        response = _get_current_time()
+        database.append_stream_chunk(session_id, turn_id, 0, response)
+        database.append_message(session_id, "assistant", response, turn_id)
+        database.complete_turn(session_id, turn_id, response)
+        return response
+
+    if re.search(r"\b(today(?:'s)? date|current date|what date is it|what(?:'s| is) today's date|date today|date)\b", normalized_prompt):
+        response = _get_current_date()
+        database.append_stream_chunk(session_id, turn_id, 0, response)
+        database.append_message(session_id, "assistant", response, turn_id)
+        database.complete_turn(session_id, turn_id, response)
+        return response
+
+    if "mac stat" in normalized_prompt or "cpu usage" in normalized_prompt:
+        response = _get_mac_metrics()
+        database.append_stream_chunk(session_id, turn_id, 0, response)
+        database.append_message(session_id, "assistant", response, turn_id)
+        database.complete_turn(session_id, turn_id, response)
+        return response
     else:
         messages.append({"role": "user", "content": prompt})
 
-    client = OpenAI(base_url="http://localhost:11434/v1", api_key="ollama")
+    client = OpenAI(
+        base_url=f"{os.getenv('OLLAMA_BASE_URL', 'http://192.168.1.85:11434').rstrip('/')}/v1",
+        api_key="ollama",
+    )
     
     full_response = ""
     sequence = 0
+    pending_chunks = []
+    last_flush = time.monotonic()
     try:
         stream = client.chat.completions.create(
-            model="llama3.2:1b",
+            model="phi4-mini",
             messages=messages,
             max_tokens=300,
             stream=True
@@ -64,11 +93,21 @@ def _sync_agent_execution(session_id: str, prompt: str, turn_id: str) -> str:
             if chunk.choices and chunk.choices[0].delta.content:
                 token = chunk.choices[0].delta.content
                 full_response += token
-                database.append_stream_chunk(turn_id, sequence, token)
+                pending_chunks.append((sequence, token))
+                should_flush = (
+                    sequence == 0
+                    or len(pending_chunks) >= 16
+                    or time.monotonic() - last_flush >= 0.1
+                )
+                if should_flush:
+                    database.append_stream_chunks(session_id, turn_id, pending_chunks)
+                    pending_chunks.clear()
+                    last_flush = time.monotonic()
                 sequence += 1
-                
+
+        database.append_stream_chunks(session_id, turn_id, pending_chunks)
     except Exception as exc:
-        database.fail_turn(turn_id, str(exc))
+        database.fail_turn(session_id, turn_id, str(exc))
         raise
 
     # === Deterministic Python Memory Extraction ===
@@ -79,7 +118,7 @@ def _sync_agent_execution(session_id: str, prompt: str, turn_id: str) -> str:
         database.upsert_fact(session_id, "name", extracted_name)
 
     database.append_message(session_id, "assistant", full_response, turn_id)
-    database.complete_turn(turn_id, full_response)
+    database.complete_turn(session_id, turn_id, full_response)
     return full_response
 
 @activity.defn

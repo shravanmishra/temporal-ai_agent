@@ -98,17 +98,24 @@
 </div>
 
 <script>
-    const SESSION_ID = "web_ui_session_002"; // Bumped version layout to keep state clear
+    const SESSION_STORAGE_KEY = 'temporal-agent-session-id-v2';
+    let sessionId = localStorage.getItem(SESSION_STORAGE_KEY) || `web_ui_${crypto.randomUUID()}`;
+    localStorage.setItem(SESSION_STORAGE_KEY, sessionId);
+    let requestInFlight = false;
 
     function handleKeyPress(e) {
         if (e.key === 'Enter') sendMessage();
     }
 
     async function sendMessage() {
+        if (requestInFlight) return;
         const inputEl = document.getElementById('userInput');
         const text = inputEl.value.trim();
         if (!text) return;
 
+        requestInFlight = true;
+        inputEl.disabled = true;
+        document.querySelector('button').disabled = true;
         inputEl.value = '';
         appendMessage(text, 'user-message');
 
@@ -118,14 +125,18 @@
             const response = await fetch('http://localhost:8000/api/chat/stream', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ session_id: SESSION_ID, prompt: text })
+                body: JSON.stringify({ session_id: sessionId, prompt: text })
             });
 
-            if (!response.ok) throw new Error("Failed connecting to backend server API");
+            if (!response.ok) {
+                const detail = await response.text();
+                throw new Error(detail || `Backend returned HTTP ${response.status}`);
+            }
 
             const reader = response.body.getReader();
             const decoder = new TextDecoder();
             let buffer = '';
+            let eventType = 'message';
 
             while (true) {
                 const { value, done } = await reader.read();
@@ -134,15 +145,25 @@
                 buffer += decoder.decode(value, { stream: true });
                 // Robustly segment incoming server lines by double line breaks
                 const lines = buffer.split('\n');
-
-                // Keep the last incomplete block back inside our tracking buffer loop
-                buffer = lines.pop();
+                buffer = lines.pop() || '';
 
                 for (const line of lines) {
                     const cleanLine = line.trim();
+                    if (cleanLine.startsWith('event: ')) {
+                        eventType = cleanLine.substring(7);
+                        continue;
+                    }
                     if (cleanLine.startsWith('data: ')) {
                         const token = line.substring(6); // Preserve white spacing fragments
-                        if (token.trim() === '[DONE]') break;
+                        if (token.trim() === '[DONE]') return;
+
+                        if (eventType === 'error') {
+                            assistantBubble.textContent = `[Workflow error: ${token}]`;
+                            sessionId = `web_ui_${crypto.randomUUID()}`;
+                            localStorage.setItem(SESSION_STORAGE_KEY, sessionId);
+                            eventType = 'message';
+                            continue;
+                        }
 
                         // Append directly to screen layout
                         assistantBubble.textContent += token;
@@ -151,8 +172,19 @@
                     }
                 }
             }
+
+            // Handle a final SSE line that arrived without a trailing newline.
+            const finalLine = buffer.trim();
+            if (finalLine.startsWith('data: ') && finalLine.substring(6).trim() !== '[DONE]') {
+                assistantBubble.textContent += finalLine.substring(6);
+            }
         } catch (err) {
             assistantBubble.textContent = `[Error rendering response stream: ${err.message}]`;
+        } finally {
+            requestInFlight = false;
+            inputEl.disabled = false;
+            document.querySelector('button').disabled = false;
+            inputEl.focus();
         }
     }
 

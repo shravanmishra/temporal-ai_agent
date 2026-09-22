@@ -1,4 +1,5 @@
 import asyncio
+import os
 import sys
 from uuid import uuid4
 from temporalio.client import Client, WorkflowUpdateStage
@@ -7,14 +8,14 @@ from temporal_agent.workflows import LiveAgentWorkflow
 
 async def main():
     try:
-        client = await Client.connect("localhost:7233")
+        client = await Client.connect(os.getenv("TEMPORAL_ADDRESS", "192.168.1.85:7233"))
     except Exception as e:
         print(f"CRITICAL: Failed connecting to Temporal Server: {e}")
         sys.exit(1)
 
-    # Use the EXACT same session ID as your web UI to share memory history!
-    SESSION_ID = "web_ui_session_002"
-    database.init_db()
+    session_id = os.getenv("SESSION_ID", f"console_{uuid4()}")
+    SESSION_ID = session_id
+    database.init_db(SESSION_ID)
 
     try:
         handle = client.get_workflow_handle(SESSION_ID)
@@ -41,7 +42,7 @@ async def main():
 
         # Send prompt update to Temporal
         turn_id = str(uuid4())
-        database.create_turn(turn_id, SESSION_ID, prompt)
+        database.create_turn(SESSION_ID, turn_id, prompt)
         await handle.start_update(
             LiveAgentWorkflow.handle_agent_turn,
             args=[SESSION_ID, prompt, turn_id],
@@ -53,12 +54,12 @@ async def main():
         next_sequence = 0
         while True:
             await asyncio.sleep(0.03)
-            chunks = database.load_stream_chunks(turn_id, next_sequence)
+            chunks = database.load_stream_chunks(SESSION_ID, turn_id, next_sequence)
             for sequence, chunk in chunks:
                 next_sequence = sequence + 1
                 print(str(chunk), end="", flush=True)
 
-            turn = database.get_turn(turn_id)
+            turn = database.get_turn(SESSION_ID, turn_id)
             if turn and turn["status"] in {"completed", "failed"}:
                 break
 

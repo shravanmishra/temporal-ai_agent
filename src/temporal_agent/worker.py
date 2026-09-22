@@ -9,7 +9,7 @@ from temporal_agent.workflows import LiveAgentWorkflow
 
 
 async def run_worker() -> None:
-    client = await Client.connect(os.getenv("TEMPORAL_ADDRESS", "localhost:7233"))
+    client = await Client.connect(os.getenv("TEMPORAL_ADDRESS", "192.168.1.85:7233"))
     worker = Worker(
         client,
         task_queue=os.getenv("TEMPORAL_TASK_QUEUE", "live-agent-tasks"),
